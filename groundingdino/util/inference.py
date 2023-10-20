@@ -63,15 +63,18 @@ def predict(
     image = image.to(device)
 
     with torch.no_grad():
-        outputs = model(image, captions=[caption])
+        outputs = model(image, captions=[caption] * image.shape[0])
 
     prediction_logits = outputs["pred_logits"].cpu().sigmoid()  # prediction_logits.shape = (b, nq, 256)
     prediction_boxes = outputs["pred_boxes"].cpu()  # prediction_boxes.shape = (b, nq, 4)
 
-    mask = prediction_logits.max(dim=2)[0] > box_threshold
-    logits = prediction_logits[mask]  # logits.shape = (b, n, 256)
-    boxes = prediction_boxes[mask]  # boxes.shape = (b, n, 4)
-    return boxes, logits.max(dim=2)[0]
+    masks = prediction_logits.max(dim=2)[0] > box_threshold
+    logits = []
+    boxes = []
+    for idx, mask in enumerate(masks):
+        logits.append(prediction_logits[idx][mask].max(dim=1)[0])
+        boxes.append(prediction_boxes[idx][mask])
+    return boxes, logits
 
 
 def annotate(image_source: np.ndarray, boxes: torch.Tensor, logits: torch.Tensor, phrases: List[str]) -> np.ndarray:
@@ -114,7 +117,7 @@ class Model:
 
     def predict_with_caption(
         self,
-        image: torch.Tensor,
+        images: List[str],
         caption: str,
         box_threshold: float = 0.35,
     ) -> Tuple[sv.Detections, List[str]]:
@@ -136,14 +139,20 @@ class Model:
         box_annotator = sv.BoxAnnotator()
         annotated_image = box_annotator.annotate(scene=image, detections=detections, labels=labels)
         """
-        processed_image = image.to(self.device)
+        processed_image = []
+        image_tensors = []
+        for image in images:
+            image_tensor, image_processed = load_image(image)
+            processed_image.append(image_processed)
+            image_tensors.append(image_tensor)
+        processed_image = torch.stack(processed_image, dim=0).to(self.device)
         boxes, logits = predict(
             model=self.model,
             image=processed_image,
             caption=caption,
             box_threshold=box_threshold,
             device=self.device)
-        _, source_h, source_w, _ = image.shape
+        source_h, source_w, _ = image_tensors[0].shape
         detections = Model.post_process_result(
             source_h=source_h,
             source_w=source_w,
@@ -153,7 +162,7 @@ class Model:
 
     def predict_with_classes(
         self,
-        image: torch.Tensor,
+        images: List[str],
         classes: List[str],
         box_threshold: float,
     ) -> sv.Detections:
@@ -177,14 +186,20 @@ class Model:
         annotated_image = box_annotator.annotate(scene=image, detections=detections)
         """
         caption = ". ".join(classes)
-        processed_image = image.to(self.device)
+        processed_image = []
+        image_tensors = []
+        for image in images:
+            image_tensor, image_processed = load_image(image)
+            processed_image.append(image_processed)
+            image_tensors.append(image_tensor)
+        processed_image = torch.stack(processed_image, dim=0).to(self.device)
         boxes, logits = predict(
             model=self.model,
             image=processed_image,
             caption=caption,
             box_threshold=box_threshold,
             device=self.device)
-        _, _, source_h, source_w = image.shape
+        source_h, source_w, _ = image_tensors[0].shape
         detections = Model.post_process_result(
             source_h=source_h,
             source_w=source_w,
@@ -209,13 +224,16 @@ class Model:
     def post_process_result(
             source_h: int,
             source_w: int,
-            boxes: torch.Tensor,
-            logits: torch.Tensor
+            boxes: List[torch.Tensor],
+            logits: List[torch.Tensor]
     ) -> sv.Detections:
-        boxes = boxes * torch.Tensor([source_w, source_h, source_w, source_h])[None, None, :]
-        xyxys = box_convert(boxes=boxes, in_fmt="cxcywh", out_fmt="xyxy").numpy()
-        confidences = logits.numpy()
-        return [sv.Detections(xyxy=xyxy, confidence=confidence) for xyxy, confidence in zip(xyxys, confidences)]
+        result = []
+        for box, logit in zip(boxes, logits):
+            box = box * torch.Tensor([source_w, source_h, source_w, source_h])
+            xyxy = box_convert(boxes=box, in_fmt="cxcywh", out_fmt="xyxy").numpy()
+            confidence = logit.numpy()
+            result.append(sv.Detections(xyxy=xyxy, confidence=confidence))
+        return result
 
     @staticmethod
     def phrases2classes(phrases: List[str], classes: List[str]) -> np.ndarray:
